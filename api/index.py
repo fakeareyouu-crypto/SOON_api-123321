@@ -8,6 +8,8 @@ app = FastAPI(title="Zapupi Integrated Payment API", docs_url="/docs", openapi_u
 
 # --- CONFIGURATION ---
 ZAP_KEY = os.environ.get("ZAP_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 ZAPUPI_CREATE_ORDER_URL = "https://pay.zapupi.com/api/create-order"
 
 SUCCESS_URL = "https://yourwebsite.com/payment-success"
@@ -17,16 +19,30 @@ TIMEOUT_URL = "https://yourwebsite.com/payment-timeout"
 class CreateOrderRequest(BaseModel):
     amount: float
 
+# Headers for Supabase REST API
+def get_supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+
 # --- 1. ENDPOINT: CREATE ORDER ---
 @app.post("/api/create-payment")
 async def create_payment(payload: CreateOrderRequest):
-    if not ZAP_KEY:
-        raise HTTPException(status_code=500, detail="ZAP_KEY environment variable is missing.")
+    if not ZAP_KEY or not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(status_code=500, detail="Missing configuration environment variables on Vercel.")
 
+    order_id = str(uuid.uuid4().hex[:8]).upper()
     amount = payload.amount
-    # We append the amount directly into the ID sequence string safely
-    unique_stub = str(uuid.uuid4().hex[:6]).upper()
-    order_id = f"{unique_stub}X{int(amount)}"
+    
+    row_data = {"order_id": order_id, "amount": amount, "status": "Payment Pending"}
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/orders"
+        requests.post(url, json=row_data, headers=get_supabase_headers(), timeout=5)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database save failed: {str(e)}")
 
     zapupi_payload = {
         "zap_key": ZAP_KEY,
@@ -63,8 +79,19 @@ async def zapupi_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON format")
         
-    # We return acknowledged immediately because we don't have to update any DB!
-    return {"status": "acknowledged"}
+    order_id = str(payload.get("order_id", "")).strip().upper()
+    status = payload.get("status", "success")
+    final_status = "Success" if status == "success" else status
+    
+    # Update row in Supabase
+    url = f"{SUPABASE_URL}/rest/v1/orders?order_id=eq.{order_id}"
+    headers = get_supabase_headers()
+    
+    res = requests.patch(url, json={"status": final_status}, headers=headers, timeout=5)
+    if res.status_code in [200, 204]:
+        return {"status": "acknowledged"}
+            
+    return {"status": "ignored", "message": "Order not updated"}
 
 
 # --- 3. ENDPOINT: CHECK STATUS ---
@@ -72,20 +99,15 @@ async def zapupi_webhook(request: Request):
 async def check_status(order_id: str):
     clean_id = order_id.strip().upper()
     
-    # Extract the amount out of the ID string automatically
-    if "X" not in clean_id:
-        raise HTTPException(status_code=404, detail="Invalid Order ID format structure.")
+    url = f"{SUPABASE_URL}/rest/v1/orders?order_id=eq.{clean_id}&select=*"
+    res = requests.get(url, headers=get_supabase_headers(), timeout=5)
+    
+    if res.status_code != 200 or not res.json():
+        raise HTTPException(status_code=404, detail="Order ID code does not exist.")
         
-    try:
-        _, amount_part = clean_id.split("X", 1)
-        amount = float(amount_part)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not parse transaction metadata.")
-
-    # Since there is no database tracking if it is fully settled, we fallback 
-    # to evaluating its validity context instantly.
+    order_data = res.json()[0]
     return {
         "order_id": clean_id,
-        "amount": amount,
-        "status": "Active Payment Session Verified"
+        "amount": order_data["amount"],
+        "status": order_data["status"]
     }
