@@ -5,15 +5,30 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-from upstash_redis import Redis
 
 app = FastAPI(title="Zapupi Integrated Payment API", docs_url="/docs", openapi_url="/openapi.json")
 
-# Initialize connection safely from environment variables
-try:
-    kv = Redis.from_env()
-except Exception as e:
-    kv = None
+# --- SIMULATED HARDWARE STORAGE DIRECTORY ---
+# Vercel allows write access exclusively to the serverless /tmp folder
+STORAGE_FILE = "/tmp/orders_db.json"
+
+def load_local_db() -> dict:
+    """Helper to cleanly read the temp file storage."""
+    if not os.path.exists(STORAGE_FILE):
+        return {}
+    try:
+        with open(STORAGE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_local_db(data: dict):
+    """Helper to cleanly write changes back to the temp file storage."""
+    try:
+        with open(STORAGE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 # --- CONFIGURATION ---
 ZAP_KEY = os.environ.get("ZAP_KEY")
@@ -46,20 +61,18 @@ class ZapupiWebhookPayload(BaseModel):
 async def create_payment(payload: CreateOrderRequest):
     if not ZAP_KEY:
         raise HTTPException(status_code=500, detail="Server Error: ZAP_KEY environment variable is missing.")
-    if not kv:
-        raise HTTPException(status_code=500, detail="Server Error: Redis client could not connect.")
 
     order_id = str(uuid.uuid4().hex[:8]).upper()
     amount = payload.amount
 
-    order_data = {
+    # Fetch our file system tracking structure
+    db_orders = load_local_db()
+    db_orders[order_id] = {
         "status": "Payment Pending",
         "amount": amount,
         "zapupi_details": None
     }
-    
-    # FIX: Safely stringify the dictionary into JSON before saving to Redis
-    kv.set(f"order:{order_id}", json.dumps(order_data))
+    save_local_db(db_orders)
 
     zapupi_payload = {
         "zap_key": ZAP_KEY,
@@ -94,42 +107,26 @@ async def create_payment(payload: CreateOrderRequest):
 @app.post("/api/webhook/zapupi")
 async def zapupi_webhook(payload: ZapupiWebhookPayload):
     order_id = payload.order_id
-    db_key = f"order:{order_id}"
+    db_orders = load_local_db()
     
-    raw_data = kv.get(db_key)
-    
-    if raw_data:
-        # FIX: Safely unpack string back into a Python Dictionary
-        if isinstance(raw_data, str):
-            order_data = json.loads(raw_data)
-        else:
-            order_data = raw_data
-
-        order_data["status"] = payload.status  
-        order_data["zapupi_details"] = payload.dict()
-        
-        # Save structural JSON back to string storage
-        kv.set(db_key, json.dumps(order_data))
+    if order_id in db_orders:
+        db_orders[order_id]["status"] = payload.status  
+        db_orders[order_id]["zapupi_details"] = payload.dict()
+        save_local_db(db_orders)
         return {"status": "acknowledged"}
     else:
-        raise HTTPException(status_code=404, detail="Order ID not found in database")
+        raise HTTPException(status_code=404, detail="Order ID not found in system storage")
 
 
 # --- 3. ENDPOINT: CHECK STATUS ---
 @app.get("/api/check-status/{order_id}")
 async def check_status(order_id: str):
-    db_key = f"order:{order_id}"
-    raw_data = kv.get(db_key)
+    db_orders = load_local_db()
     
-    if not raw_data:
+    if order_id not in db_orders:
         raise HTTPException(status_code=404, detail="Order ID code does not exist.")
         
-    # FIX: Parse the text data cleanly back into JSON parameters
-    if isinstance(raw_data, str):
-        order_data = json.loads(raw_data)
-    else:
-        order_data = raw_data
-        
+    order_data = db_orders[order_id]
     return {
         "order_id": order_id,
         "amount": order_data["amount"],
