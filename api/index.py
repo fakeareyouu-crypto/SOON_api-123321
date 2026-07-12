@@ -7,7 +7,7 @@ from pydantic import BaseModel
 app = FastAPI(title="Zapupi Integrated Payment API", docs_url="/docs")
 
 # Replace this with the unique URL you got from running the curl command above!
-KV_BUCKET_URL = "https://kvdb.io/YOUR_GENERATED_BUCKET_ID"
+KV_BUCKET_URL = "https://kvdb.io/XaEy1AsdVB47ajcDwDpp7d/"
 
 # --- CONFIGURATION ---
 ZAP_KEY = os.environ.get("ZAP_KEY")
