@@ -1,19 +1,19 @@
 import os
+import json
 import uuid
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-# Use Upstash Redis client to interact with Vercel KV
 from upstash_redis import Redis
 
 app = FastAPI(title="Zapupi Integrated Payment API", docs_url="/docs", openapi_url="/openapi.json")
 
-# Initialize connection to Vercel KV automatically using the environment variables Vercel provides
-kv = Redis(
-    url=os.environ.get("KV_REST_API_URL"), 
-    token=os.environ.get("KV_REST_API_TOKEN")
-)
+# Initialize connection safely from environment variables
+try:
+    kv = Redis.from_env()
+except Exception as e:
+    kv = None
 
 # --- CONFIGURATION ---
 ZAP_KEY = os.environ.get("ZAP_KEY")
@@ -45,20 +45,21 @@ class ZapupiWebhookPayload(BaseModel):
 @app.post("/api/create-payment")
 async def create_payment(payload: CreateOrderRequest):
     if not ZAP_KEY:
-        raise HTTPException(status_code=500, detail="Server Error: ZAP_KEY is not configured.")
+        raise HTTPException(status_code=500, detail="Server Error: ZAP_KEY environment variable is missing.")
+    if not kv:
+        raise HTTPException(status_code=500, detail="Server Error: Redis client could not connect.")
 
     order_id = str(uuid.uuid4().hex[:8]).upper()
     amount = payload.amount
 
-    # Save initial pending state permanently into Vercel KV
     order_data = {
         "status": "Payment Pending",
         "amount": amount,
         "zapupi_details": None
     }
     
-    # kv.json().set lets you store data arrays/dictionaries directly
-    kv.set(f"order:{order_id}", order_data)
+    # FIX: Safely stringify the dictionary into JSON before saving to Redis
+    kv.set(f"order:{order_id}", json.dumps(order_data))
 
     zapupi_payload = {
         "zap_key": ZAP_KEY,
@@ -95,16 +96,20 @@ async def zapupi_webhook(payload: ZapupiWebhookPayload):
     order_id = payload.order_id
     db_key = f"order:{order_id}"
     
-    # Fetch existing data from Vercel KV
-    order_data = kv.get(db_key)
+    raw_data = kv.get(db_key)
     
-    if order_data:
-        # Update fields dynamically
+    if raw_data:
+        # FIX: Safely unpack string back into a Python Dictionary
+        if isinstance(raw_data, str):
+            order_data = json.loads(raw_data)
+        else:
+            order_data = raw_data
+
         order_data["status"] = payload.status  
         order_data["zapupi_details"] = payload.dict()
         
-        # Save changes back to Vercel KV
-        kv.set(db_key, order_data)
+        # Save structural JSON back to string storage
+        kv.set(db_key, json.dumps(order_data))
         return {"status": "acknowledged"}
     else:
         raise HTTPException(status_code=404, detail="Order ID not found in database")
@@ -114,10 +119,16 @@ async def zapupi_webhook(payload: ZapupiWebhookPayload):
 @app.get("/api/check-status/{order_id}")
 async def check_status(order_id: str):
     db_key = f"order:{order_id}"
-    order_data = kv.get(db_key)
+    raw_data = kv.get(db_key)
     
-    if not order_data:
+    if not raw_data:
         raise HTTPException(status_code=404, detail="Order ID code does not exist.")
+        
+    # FIX: Parse the text data cleanly back into JSON parameters
+    if isinstance(raw_data, str):
+        order_data = json.loads(raw_data)
+    else:
+        order_data = raw_data
         
     return {
         "order_id": order_id,
