@@ -1,34 +1,13 @@
 import os
-import json
 import uuid
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from typing import List
 
-app = FastAPI(title="Zapupi Integrated Payment API", docs_url="/docs", openapi_url="/openapi.json")
+app = FastAPI(title="Zapupi Integrated Payment API", docs_url="/docs")
 
-# --- SIMULATED HARDWARE STORAGE DIRECTORY ---
-# Vercel allows write access exclusively to the serverless /tmp folder
-STORAGE_FILE = "/tmp/orders_db.json"
-
-def load_local_db() -> dict:
-    """Helper to cleanly read the temp file storage."""
-    if not os.path.exists(STORAGE_FILE):
-        return {}
-    try:
-        with open(STORAGE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_local_db(data: dict):
-    """Helper to cleanly write changes back to the temp file storage."""
-    try:
-        with open(STORAGE_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
+# Replace this with the unique URL you got from running the curl command above!
+KV_BUCKET_URL = "https://kvdb.io/YOUR_GENERATED_BUCKET_ID"
 
 # --- CONFIGURATION ---
 ZAP_KEY = os.environ.get("ZAP_KEY")
@@ -38,41 +17,21 @@ SUCCESS_URL = "https://yourwebsite.com/payment-success"
 FAILED_URL = "https://yourwebsite.com/payment-failed"
 TIMEOUT_URL = "https://yourwebsite.com/payment-timeout"
 
-
 class CreateOrderRequest(BaseModel):
     amount: float
-
-class ZapupiWebhookPayload(BaseModel):
-    order_id: str
-    txn_id: str
-    status: str
-    amount: str
-    pay_amount: str
-    utr: str
-    customer_mobile: str
-    remark: str
-    remark_array: List[str]
-    create_at: str
-    environment: str
-
 
 # --- 1. ENDPOINT: CREATE ORDER ---
 @app.post("/api/create-payment")
 async def create_payment(payload: CreateOrderRequest):
     if not ZAP_KEY:
-        raise HTTPException(status_code=500, detail="Server Error: ZAP_KEY environment variable is missing.")
+        raise HTTPException(status_code=500, detail="ZAP_KEY environment variable is missing.")
 
     order_id = str(uuid.uuid4().hex[:8]).upper()
     amount = payload.amount
 
-    # Fetch our file system tracking structure
-    db_orders = load_local_db()
-    db_orders[order_id] = {
-        "status": "Payment Pending",
-        "amount": amount,
-        "zapupi_details": None
-    }
-    save_local_db(db_orders)
+    # Save to cloud bucket permanently
+    order_data = {"status": "Payment Pending", "amount": amount}
+    requests.post(f"{KV_BUCKET_URL}/order_{order_id}", json=order_data, timeout=5)
 
     zapupi_payload = {
         "zap_key": ZAP_KEY,
@@ -92,43 +51,49 @@ async def create_payment(payload: CreateOrderRequest):
                 "status": "success",
                 "order_id": order_id,
                 "amount": amount,
-                "payment_url": response_data.get("payment_url"),
-                "zapupi_txn_id": response_data.get("txn_id")
+                "payment_url": response_data.get("payment_url")
             }
         else:
             error_msg = response_data.get("message", "Unknown error from Zapupi backend")
             raise HTTPException(status_code=400, detail=f"Zapupi Error: {error_msg}")
-
     except requests.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to connect to Zapupi server: {str(e)}")
 
-
 # --- 2. ENDPOINT: WEBHOOK LISTENER ---
 @app.post("/api/webhook/zapupi")
-async def zapupi_webhook(payload: ZapupiWebhookPayload):
-    order_id = payload.order_id
-    db_orders = load_local_db()
+async def zapupi_webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON format")
+        
+    order_id = str(payload.get("order_id", "")).strip().upper()
+    status = payload.get("status", "success")
     
-    if order_id in db_orders:
-        db_orders[order_id]["status"] = payload.status  
-        db_orders[order_id]["zapupi_details"] = payload.dict()
-        save_local_db(db_orders)
+    # Fetch from live cloud bucket
+    res = requests.get(f"{KV_BUCKET_URL}/order_{order_id}", timeout=5)
+    if res.status_code == 200:
+        order_data = res.json()
+        order_data["status"] = "Success" if status == "success" else status
+        
+        # Save updated status back to cloud bucket
+        requests.post(f"{KV_BUCKET_URL}/order_{order_id}", json=order_data, timeout=5)
         return {"status": "acknowledged"}
-    else:
-        raise HTTPException(status_code=404, detail="Order ID not found in system storage")
-
+            
+    return {"status": "ignored", "message": "Order reference mismatch"}
 
 # --- 3. ENDPOINT: CHECK STATUS ---
 @app.get("/api/check-status/{order_id}")
 async def check_status(order_id: str):
-    db_orders = load_local_db()
+    clean_id = order_id.strip().upper()
     
-    if order_id not in db_orders:
+    res = requests.get(f"{KV_BUCKET_URL}/order_{clean_id}", timeout=5)
+    if res.status_code != 200:
         raise HTTPException(status_code=404, detail="Order ID code does not exist.")
         
-    order_data = db_orders[order_id]
+    order_data = res.json()
     return {
-        "order_id": order_id,
+        "order_id": clean_id,
         "amount": order_data["amount"],
         "status": order_data["status"]
     }
