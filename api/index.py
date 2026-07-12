@@ -70,11 +70,10 @@ async def create_payment(payload: CreateOrderRequest):
         raise HTTPException(status_code=500, detail=f"Failed to connect to Zapupi server: {str(e)}")
 
 
-# --- 2. ENDPOINT: WEBHOOK LISTENER (Handles both slash variants) ---
+# --- 2. ENDPOINT: WEBHOOK LISTENER ---
 @app.post("/api/webhook/zapupi")
 @app.post("/api/webhook/zapupi/")
 async def zapupi_webhook(request: Request):
-    # Completely loose data parsing layer to catch form-data or JSON payloads safely
     payload = {}
     try:
         payload = await request.json()
@@ -89,14 +88,13 @@ async def zapupi_webhook(request: Request):
     
     order_id = payload.get("order_id") or payload.get("ORDER_ID")
     if not order_id:
-        # Returns a 200 anyway so ZapUPI stops retrying if it sent a bad ping
         return {"status": "ignored", "message": "Missing order reference parameter"}
         
     order_id = str(order_id).strip().upper()
     incoming_status = str(payload.get("status", "")).strip().lower()
     final_status = "Success" if incoming_status in ["success", "paid"] else "Failed"
     
-    # Update row in Supabase
+    # FIX: Added get_supabase_headers() here so Supabase actually accepts the update!
     url = f"{SUPABASE_URL}/rest/v1/orders?order_id=eq.{order_id}"
     res = requests.patch(url, json={"status": final_status}, headers=get_supabase_headers(), timeout=5)
     
