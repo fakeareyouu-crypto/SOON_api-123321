@@ -19,7 +19,6 @@ TIMEOUT_URL = "https://yourwebsite.com/payment-timeout"
 class CreateOrderRequest(BaseModel):
     amount: float
 
-# Headers for Supabase REST API
 def get_supabase_headers():
     return {
         "apikey": SUPABASE_KEY,
@@ -80,8 +79,10 @@ async def zapupi_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON format")
         
     order_id = str(payload.get("order_id", "")).strip().upper()
-    status = payload.get("status", "success")
-    final_status = "Success" if status == "success" else status
+    
+    # FIX: Extract status and convert to lowercase to handle "Success" or "success" safely
+    incoming_status = str(payload.get("status", "")).strip().lower()
+    final_status = "Success" if incoming_status == "success" else payload.get("status", "Failed")
     
     # Update row in Supabase
     url = f"{SUPABASE_URL}/rest/v1/orders?order_id=eq.{order_id}"
