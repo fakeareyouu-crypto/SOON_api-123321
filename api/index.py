@@ -75,14 +75,20 @@ async def create_payment(payload: CreateOrderRequest):
 async def zapupi_webhook(request: Request):
     try:
         payload = await request.json()
+        print(f"ZAPUPI WEBHOOK RECEIVED DATA: {payload}")  # This will show up in your Vercel logs!
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON format")
         
-    order_id = str(payload.get("order_id", "")).strip().upper()
+    # Check both lowercase 'order_id' or uppercase 'ORDER_ID' just in case
+    order_id = payload.get("order_id") or payload.get("ORDER_ID")
+    if not order_id:
+        return {"status": "ignored", "message": "No order_id found in payload"}
+        
+    order_id = str(order_id).strip().upper()
     
-    # FIX: Extract status and convert to lowercase to handle "Success" or "success" safely
+    # Extract status safely (check multiple case options)
     incoming_status = str(payload.get("status", "")).strip().lower()
-    final_status = "Success" if incoming_status == "success" else payload.get("status", "Failed")
+    final_status = "Success" if incoming_status in ["success", "paid"] else "Failed"
     
     # Update row in Supabase
     url = f"{SUPABASE_URL}/rest/v1/orders?order_id=eq.{order_id}"
@@ -90,9 +96,9 @@ async def zapupi_webhook(request: Request):
     
     res = requests.patch(url, json={"status": final_status}, headers=headers, timeout=5)
     if res.status_code in [200, 204]:
-        return {"status": "acknowledged"}
+        return {"status": "acknowledged", "updated_order": order_id, "new_status": final_status}
             
-    return {"status": "ignored", "message": "Order not updated"}
+    return {"status": "ignored", "message": f"Order {order_id} not found or not updated in DB"}
 
 
 # --- 3. ENDPOINT: CHECK STATUS ---
