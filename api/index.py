@@ -70,35 +70,37 @@ async def create_payment(payload: CreateOrderRequest):
         raise HTTPException(status_code=500, detail=f"Failed to connect to Zapupi server: {str(e)}")
 
 
-# --- 2. ENDPOINT: WEBHOOK LISTENER ---
+# --- 2. ENDPOINT: WEBHOOK LISTENER (Handles both slash variants) ---
 @app.post("/api/webhook/zapupi")
+@app.post("/api/webhook/zapupi/")
 async def zapupi_webhook(request: Request):
+    # Completely loose data parsing layer to catch form-data or JSON payloads safely
+    payload = {}
     try:
         payload = await request.json()
-        print(f"ZAPUPI WEBHOOK RECEIVED DATA: {payload}")  # This will show up in your Vercel logs!
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON format")
-        
-    # Check both lowercase 'order_id' or uppercase 'ORDER_ID' just in case
+        try:
+            form_data = await request.form()
+            payload = dict(form_data)
+        except Exception:
+            pass
+
+    print(f"CRITICAL WEBHOOK INCOMING SIGNAL DATA: {payload}")
+    
     order_id = payload.get("order_id") or payload.get("ORDER_ID")
     if not order_id:
-        return {"status": "ignored", "message": "No order_id found in payload"}
+        # Returns a 200 anyway so ZapUPI stops retrying if it sent a bad ping
+        return {"status": "ignored", "message": "Missing order reference parameter"}
         
     order_id = str(order_id).strip().upper()
-    
-    # Extract status safely (check multiple case options)
     incoming_status = str(payload.get("status", "")).strip().lower()
     final_status = "Success" if incoming_status in ["success", "paid"] else "Failed"
     
     # Update row in Supabase
     url = f"{SUPABASE_URL}/rest/v1/orders?order_id=eq.{order_id}"
-    headers = get_supabase_headers()
+    res = requests.patch(url, json={"status": final_status}, headers=get_supabase_headers(), timeout=5)
     
-    res = requests.patch(url, json={"status": final_status}, headers=headers, timeout=5)
-    if res.status_code in [200, 204]:
-        return {"status": "acknowledged", "updated_order": order_id, "new_status": final_status}
-            
-    return {"status": "ignored", "message": f"Order {order_id} not found or not updated in DB"}
+    return {"status": "processed", "target": order_id, "db_response": res.status_code}
 
 
 # --- 3. ENDPOINT: CHECK STATUS ---
